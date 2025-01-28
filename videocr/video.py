@@ -82,8 +82,12 @@ class Video:
                                 continue
 
                         prev_grey = grey
+                        
+                    pred_data = ocr.ocr(frame)
+                    if(pred_data == None or pred_data[0] == None):
+                        continue
 
-                    predicted_frames = PredictedFrames(i + ocr_start, ocr.ocr(frame), conf_threshold_percent)
+                    predicted_frames = PredictedFrames(i + ocr_start, pred_data , conf_threshold_percent)
                     self.pred_frames.append(predicted_frames)
                 else:
                     v.read()
