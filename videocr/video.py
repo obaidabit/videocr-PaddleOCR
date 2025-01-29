@@ -76,7 +76,7 @@ class Video:
                         grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                         if prev_grey is not None:
                             _, absdiff = cv2.threshold(cv2.absdiff(prev_grey, grey), similar_pixel_threshold, 255, cv2.THRESH_BINARY)
-                            if np.count_nonzero(absdiff) < similar_image_threshold:
+                            if np.count_nonzero(absdiff) < similar_image_threshold and predicted_frames is not None:
                                 predicted_frames.end_index = i + ocr_start
                                 prev_grey = grey
                                 continue
@@ -84,7 +84,7 @@ class Video:
                         prev_grey = grey
                         
                     pred_data = ocr.ocr(frame)
-                    if(pred_data == None or pred_data[0] == None):
+                    if(pred_data is None or pred_data[0] is None):
                         continue
 
                     predicted_frames = PredictedFrames(i + ocr_start, pred_data , conf_threshold_percent)
