@@ -6,12 +6,15 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import paddle
 import yaml
 from paddleocr import PaddleOCR
 
 from . import utils
 from .models import PredictedFrames, PredictedSubtitle
 from .opencv_adapter import Capture
+
+logger = logging.getLogger(__name__)
 
 # PaddleOCR/PaddleX log a lot of noise; keep the console readable.
 logging.getLogger('paddleocr').setLevel(logging.ERROR)
@@ -31,6 +34,14 @@ def _model_name_from_dir(model_dir: str | None) -> str | None:
         return None
     config = yaml.safe_load(config_file.read_text(encoding='utf-8')) or {}
     return config.get('Global', {}).get('model_name')
+
+
+def _cuda_available() -> bool:
+    """Return whether a CUDA GPU is usable by the installed PaddlePaddle build."""
+    try:
+        return paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
+    except Exception:
+        return False
 
 
 class Video:
@@ -57,7 +68,14 @@ class Video:
         Unless explicit model directories are given, PaddleOCR's own default
         models (server-grade PP-OCRv6 "medium", or the prebuilt models for
         the given ``lang``) are used for the best quality.
+
+        A GPU request automatically falls back to CPU when no GPU is usable
+        (for example on a CPU-only Colab runtime).
         """
+        if use_gpu and not _cuda_available():
+            logger.warning('use_gpu=True, but no GPU is available; falling back to CPU')
+            use_gpu = False
+
         kwargs = {}
         if self.det_model_dir is None and self.rec_model_dir is None:
             # Let PaddleOCR pick the default models for the language.

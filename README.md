@@ -173,7 +173,7 @@ Input Video Quality       | Use lower quality           | Use higher quality  | 
 
 - `use_gpu`
 
-  Set to `True` if performing OCR with a GPU (requires the `paddlepaddle-gpu` package, see prerequisites). Internally maps to PaddleOCR's `device` parameter.
+  Set to `True` if performing OCR with a GPU (requires the `paddlepaddle-gpu` package, see prerequisites). Internally maps to PaddleOCR's `device` parameter. If no GPU is available (for example on a CPU-only Colab runtime), videocr automatically falls back to CPU and logs a warning.
 
 - `brightness_threshold`
   
