@@ -1,7 +1,7 @@
 # videocr
 
 Extract hardcoded (burned-in) subtitles from videos using the [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) OCR engine with Python. A Colab notebook for installing and running this library is included for convenience:
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/oliverfei/videocr-PaddleOCR/blob/master/videocr_PaddleOCR.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/obaidabit/videocr-PaddleOCR/blob/master/videocr_PaddleOCR.ipynb)
 
 ```python
 # example.py
@@ -61,21 +61,37 @@ example.srt:
 ```
 
 ## Install prerequisites
-Python 3.12
 
-paddlepaddle or paddlepaddle-gpu See https://www.paddlepaddle.org.cn/install/quick?docurl=/documentation/docs/en/install/pip/linux-pip_en.html
+- Python **3.10 - 3.13** (3.13 recommended). PaddlePaddle does not ship wheels for Python 3.14 yet.
+- `paddlepaddle` (CPU) or `paddlepaddle-gpu` (GPU)
+
+`videocr` uses the PaddleOCR 3.x API. Install the PaddlePaddle framework that matches your platform first:
+
+```bash
+# CPU (from PyPI)
+python -m pip install paddlepaddle
+
+# GPU (official Paddle index; cu126 build needs driver >= 550, use cu118 for older drivers)
+python -m pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+```
+
+See https://www.paddlepaddle.org.cn/en/install/quick for the full list of framework builds (Windows, macOS, different CUDA versions, ...).
 
 ## Installation
 
-`pip install git+https://github.com/oliverfei/videocr-PaddleOCR.git`
+`pip install git+https://github.com/obaidabit/videocr-PaddleOCR.git`
 
 Alternatively for development:
 1. Clone this repo
-2. From the root directory of this repository run `python -m pip install .`
+2. From the root directory of this repository run `python -m pip install -e ".[cpu]"` (or `python -m pip install -e .` if you installed PaddlePaddle yourself)
+
+The OCR models (PP-OCRv5/v6) are downloaded automatically on the first run.
 
 ## Performance
 
 The OCR process can be very slow on CPU. Running with `paddlepaddle-gpu` is recommended if you have a CUDA GPU.
+
+By default PaddleOCR's server-grade `PP-OCRv6_medium` models (or the prebuilt models matching `lang`) are used, which give the best accuracy but are much slower on CPU (~5x slower than the mobile `PP-OCRv6_small` tier). A GPU is recommended — e.g. the included Colab notebook. Any other prebuilt model can be used instead by downloading it and passing `det_model_dir` / `rec_model_dir`.
 
 ## Tips
 
@@ -116,7 +132,7 @@ Input Video Quality       | Use lower quality           | Use higher quality  | 
 
 - `lang`
 
-  The language of the subtitles. See [PaddleOCR docs](https://github.com/PaddlePaddle/PaddleOCR/blob/release/2.6/doc/doc_en/multi_languages_en.md#5-support-languages-and-abbreviations) for list of supported languages and their abbreviations
+  The language of the subtitles (`ch`, `en`, `japan`, `korean`, `chinese_cht`, ...). See the [PaddleOCR 3.x docs](https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/OCR.html) for the full list of supported languages and their abbreviations.
 
 - `conf_threshold`
 
@@ -145,19 +161,19 @@ Input Video Quality       | Use lower quality           | Use higher quality  | 
 
 - `det_model_dir`
 
-  the text detection inference model folder. There are two ways to transfer parameters, 1. None: Automatically download the built-in model to ~/.paddleocr/det; 2. The path of a specific inference model, the model and params files must be included in the model path.
-  
-  See PaddleOCR repo for list of prebuilt models: https://github.com/PaddlePaddle/PaddleOCR/.
+  the text detection inference model folder (passed to PaddleOCR as `text_detection_model_dir`; its model name is read automatically from `inference.yml`). 1. `None`: the built-in model is downloaded automatically to `~/.paddlex/official_models` on first run; 2. the path of a specific inference model folder containing the model and params files.
+
+  See the PaddleOCR model list for prebuilt models: https://www.paddleocr.ai/latest/en/version3.x/model_list.html.
 
 - `rec_model_dir`
   
-  the text recognition inference model folder. There are two ways to transfer parameters, 1. None: Automatically download the built-in model to ~/.paddleocr/rec; 2. The path of a specific inference model, the model and params files must be included in the model path.
+  the text recognition inference model folder (passed to PaddleOCR as `text_recognition_model_dir`; its model name is read automatically from `inference.yml`). 1. `None`: the built-in model is downloaded automatically to `~/.paddlex/official_models` on first run; 2. the path of a specific inference model folder containing the model and params files.
   
-  See PaddleOCR repo for list of prebuilt models: https://github.com/PaddlePaddle/PaddleOCR/.
+  See the PaddleOCR model list for prebuilt models: https://www.paddleocr.ai/latest/en/version3.x/model_list.html.
 
 - `use_gpu`
 
-  Set to `True` if performing ocr with gpu (requires the `paddlepaddle-gpu` python package to be installed)
+  Set to `True` if performing OCR with a GPU (requires the `paddlepaddle-gpu` package, see prerequisites). Internally maps to PaddleOCR's `device` parameter.
 
 - `brightness_threshold`
   
