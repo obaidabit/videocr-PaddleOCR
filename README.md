@@ -3,6 +3,11 @@
 Extract hardcoded (burned-in) subtitles from videos using the [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) OCR engine with Python. A Colab notebook for installing and running this library is included for convenience:
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/obaidabit/videocr-PaddleOCR/blob/master/videocr_PaddleOCR.ipynb)
 
+## GUI Applications
+
+For user friendly applications that make use of this library, see:
+- https://github.com/timminator/VideOCR
+
 ```python
 # example.py
 
@@ -19,43 +24,43 @@ if __name__ == '__main__':
 example.srt:
 
 ``` 
-0
+1
 00:07:10,000 --> 00:07:10,083
 商城......现在没什么东西
 
-1
+2
 00:07:10,416 --> 00:07:12,000
 这边是战斗辅助系统
 
-2
+3
 00:07:13,083 --> 00:07:14,500
 要进去才能了解了
 
-3
+4
 00:07:15,083 --> 00:07:15,916
 没问题了吧
 
-4
+5
 00:07:16,333 --> 00:07:17,166
 我们准备登录
 
-5
+6
 00:07:18,416 --> 00:07:21,083
 啊对了， 登录没有服务器的选择么
 
-6
+7
 00:07:21,333 --> 00:07:25,000
 没有本游戏所有玩家， 都在个服务器内
 
-7
+8
 00:07:25,833 --> 00:07:28,833
 刺激了， 这么多玩家居然都不分流的么
 
-8
+9
 00:07:29,500 --> 00:07:31,083
 那......现在登录吗？
 
-9
+10
 00:07:31,166 --> 00:07:32,416
 好，登录吧！
 ```

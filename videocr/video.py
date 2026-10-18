@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 from pathlib import Path
 
 import cv2
@@ -83,6 +84,7 @@ class Video:
             self.num_frames = int(v.get(cv2.CAP_PROP_FRAME_COUNT))
             self.fps = v.get(cv2.CAP_PROP_FPS)
             self.height = int(v.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.width = int(v.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.pred_frames: list[PredictedFrames] = []
         self.pred_subs: list[PredictedSubtitle] = []
 
@@ -194,14 +196,22 @@ class Video:
 
         num_ocr_frames = ocr_end - ocr_start
         modulo = frames_to_skip + 1
-        frames_to_process = num_ocr_frames // modulo
+        frames_to_process = (num_ocr_frames + modulo - 1) // modulo
+
+        # Optional one-line progress bar; falls back to print-based progress.
+        try:
+            from tqdm import tqdm as _tqdm
+            pbar = _tqdm(total=frames_to_process, desc='Processing frames', unit='frame',
+                         dynamic_ncols=True, leave=False)
+        except Exception:
+            pbar = None
 
         # Initialize progress tracking
         start_time = time.time()
         frames_processed = 0
 
         # Calculate crop coordinates
-        crop_coords = self._get_crop_coordinates(crop_x, crop_y, crop_width, crop_height)
+        crop_coords = self._resolve_crop(use_fullframe, crop_x, crop_y, crop_width, crop_height)
 
         with Capture(self.path) as v:
             v.set(cv2.CAP_PROP_POS_FRAMES, ocr_start)
@@ -211,12 +221,16 @@ class Video:
             for i in range(num_ocr_frames):
                 if i % modulo == 0:
                     frame = v.read()[1]
+                    if frame is None:
+                        continue
                     frame = self._process_frame(frame, crop_coords, brightness_threshold)
 
                     if similar_image_threshold and prev_grey is not None:
                         skip_frame = self._check_similar_frame(frame, prev_grey, similar_image_threshold,
                                                             similar_pixel_threshold, predicted_frames, i + ocr_start)
                         if skip_frame:
+                            if pbar is not None:
+                                pbar.update(1)
                             continue
 
                     pred_data = ocr.predict(frame)
@@ -226,7 +240,9 @@ class Video:
 
                     # Update progress
                     frames_processed += 1
-                    if frames_to_process:
+                    if pbar is not None:
+                        pbar.update(1)
+                    elif frames_to_process:
                         progress = (frames_processed / frames_to_process) * 100
                         elapsed_time = time.time() - start_time
                         estimated_total = elapsed_time / (progress / 100)
@@ -235,20 +251,58 @@ class Video:
                 else:
                     v.read()
 
+            if pbar is not None:
+                pbar.close()
+
         print("\nOCR Processing completed!")
 
-    def _get_crop_coordinates(self, crop_x: int | None, crop_y: int | None,
-                              crop_width: int | None, crop_height: int | None):
-        if all([crop_x, crop_y, crop_width, crop_height]):
-            return (crop_x, crop_y, crop_x + crop_width, crop_y + crop_height)
-        return None
+    def _resolve_crop(self, use_fullframe: bool, crop_x: int | None, crop_y: int | None,
+                      crop_width: int | None, crop_height: int | None):
+        """Resolve the crop rectangle for OCR.
+
+        Returns ``(x1, y1, x2, y2)``, or ``None`` when the frame should not be
+        cropped (``use_fullframe`` or degenerate crop; the caller then uses the
+        bottom third of the frame by default).
+
+        Missing crop parameters are inferred: ``x``/``y`` default to 0 and
+        ``width``/``height`` to the remaining frame, so partial crop inputs
+        work. All parameters are clamped to valid frame ranges. Note that
+        ``crop_x``/``crop_y`` of 0 are valid values (not just falsy defaults).
+        """
+        params = [crop_x, crop_y, crop_width, crop_height]
+        if use_fullframe:
+            if any(p is not None for p in params):
+                warnings.warn('use_fullframe=True: ignoring provided crop parameters')
+            return None
+        if all(p is None for p in params):
+            return None  # default: bottom third of the frame
+
+        x = 0 if crop_x is None else int(crop_x)
+        y = 0 if crop_y is None else int(crop_y)
+        width = self.width - x if crop_width is None else int(crop_width)
+        height = self.height - y if crop_height is None else int(crop_height)
+
+        x = max(0, min(x, self.width))
+        y = max(0, min(y, self.height))
+        width = max(0, min(width, self.width - x))
+        height = max(0, min(height, self.height - y))
+        if width == 0 or height == 0:
+            warnings.warn('resolved crop has zero width/height; '
+                          'defaulting to the bottom third of the frame')
+            return None
+        if any(p is None for p in params):
+            warnings.warn('incomplete crop provided; using inferred crop: '
+                          f'x={x}, y={y}, width={width}, height={height}')
+        return (x, y, x + width, y + height)
 
     def _process_frame(self, frame, crop_coords, brightness_threshold: int | None):
-        if crop_coords and not self.use_fullframe:
-            x1, y1, x2, y2 = crop_coords
-            frame = frame[y1:y2, x1:x2]
-        elif not self.use_fullframe:
-            frame = frame[self.height // 3:, :]
+        if not self.use_fullframe:
+            if crop_coords:
+                x1, y1, x2, y2 = crop_coords
+                frame = frame[y1:y2, x1:x2]
+            else:
+                # only use the bottom third of the frame by default
+                frame = frame[2 * self.height // 3:, :]
 
         if brightness_threshold:
             frame = cv2.bitwise_and(frame, frame,
@@ -272,8 +326,8 @@ class Video:
         self._generate_subtitles(sim_threshold)
         return ''.join(
             f'{i}\n{utils.get_srt_timestamp(sub.index_start, self.fps)} --> '
-            f'{utils.get_srt_timestamp(sub.index_end, self.fps)}\n{sub.text}\n\n'
-            for i, sub in enumerate(self.pred_subs))
+            f'{utils.get_srt_timestamp(sub.index_end + 1, self.fps)}\n{sub.text}\n\n'
+            for i, sub in enumerate(self.pred_subs, start=1))
 
     def _generate_subtitles(self, sim_threshold: int) -> None:
         self.pred_subs = []
