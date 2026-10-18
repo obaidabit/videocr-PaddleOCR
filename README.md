@@ -91,7 +91,9 @@ The OCR models (PP-OCRv5/v6) are downloaded automatically on the first run.
 
 The OCR process can be very slow on CPU. Running with `paddlepaddle-gpu` is recommended if you have a CUDA GPU.
 
-By default PaddleOCR's server-grade `PP-OCRv6_medium` models (or the prebuilt models matching `lang`) are used, which give the best accuracy but are much slower on CPU (~5x slower than the mobile `PP-OCRv6_small` tier). A GPU is recommended — e.g. the included Colab notebook. Any other prebuilt model can be used instead by downloading it and passing `det_model_dir` / `rec_model_dir`.
+By default PaddleOCR's server-grade `PP-OCRv6_medium` models (or the prebuilt models matching `lang`) are used on GPUs, which give the best accuracy. On CPU, videocr automatically switches to the `PP-OCRv6_small` tier — several times faster on CPU than the medium models for a small accuracy cost — so full-video OCR stays practical on CPU-only environments such as Colab. Pass `model_tier='medium'` to always use the most accurate models, or `'tiny'` for the ultra-lightweight models.
+
+The unified PP-OCRv6 models natively cover Simplified/Traditional Chinese, English, Japanese and Latin-script languages. Other languages (Korean, Russian, Arabic, Devanagari, ...) automatically use PaddleOCR's per-language prebuilt models. Any other prebuilt model can be used too, by downloading it and passing `det_model_dir` / `rec_model_dir` (those always take precedence).
 
 ## Tips
 
@@ -115,7 +117,8 @@ Input Video Quality       | Use lower quality           | Use higher quality  | 
         conf_threshold=75, sim_threshold=80, use_fullframe=False,
         det_model_dir=None, rec_model_dir=None, use_gpu=False,
         brightness_threshold=None, similar_image_threshold=100, similar_pixel_threshold=25, frames_to_skip=1,
-        crop_x=None, crop_y=None, crop_width=None, crop_height=None)
+        crop_x=None, crop_y=None, crop_width=None, crop_height=None,
+        model_tier='auto')
     ```
 
 2. Write subtitles to `file_path`
@@ -125,7 +128,8 @@ Input Video Quality       | Use lower quality           | Use higher quality  | 
         conf_threshold=75, sim_threshold=80, use_fullframe=False,
         det_model_dir=None, rec_model_dir=None, use_gpu=False,
         brightness_threshold=None, similar_image_threshold=100, similar_pixel_threshold=25, frames_to_skip=1,
-        crop_x=None, crop_y=None, crop_width=None, crop_height=None)
+        crop_x=None, crop_y=None, crop_width=None, crop_height=None,
+        model_tier='auto')
     ```
 
 ### Parameters
@@ -173,7 +177,7 @@ Input Video Quality       | Use lower quality           | Use higher quality  | 
 
 - `use_gpu`
 
-  Set to `True` if performing OCR with a GPU (requires the `paddlepaddle-gpu` package, see prerequisites). Internally maps to PaddleOCR's `device` parameter. If no GPU is available (for example on a CPU-only Colab runtime), videocr automatically falls back to CPU and logs a warning.
+  Set to `True` if performing OCR with a GPU (requires the `paddlepaddle-gpu` package, see prerequisites). Internally maps to PaddleOCR's `device` parameter. If no GPU is available (for example on a CPU-only Colab runtime), videocr automatically falls back to CPU and logs a warning — CPU runs also switch to the fast `small` model tier unless a `model_tier` was requested (see below).
 
 - `brightness_threshold`
   
@@ -190,6 +194,12 @@ Input Video Quality       | Use lower quality           | Use higher quality  | 
 - `frames_to_skip`
 
   The number of frames to skip before sampling a frame for OCR. Keep in mind the fps of the input video before increasing.
+
+- `model_tier`
+
+  The PP-OCRv6 model size to use: `'auto'` (default), `'medium'`, `'small'` or `'tiny'`.
+
+  With `'auto'`, GPUs use the most accurate server-grade medium models (or PaddleOCR's prebuilt models for `lang`), while CPU runs automatically switch to the `small` tier, which is several times faster on CPU with only a small accuracy drop — this keeps full-video OCR practical on CPU-only runtimes. `'tiny'` selects the ultra-lightweight models (1.5M/0.4M parameters), but its recognition model does not support Japanese. Languages not covered by the unified models (see Performance) automatically use PaddleOCR's per-language prebuilt models no matter the tier. Explicit `det_model_dir`/`rec_model_dir` always take precedence over `model_tier`.
 
 ## TODO
 - [ ] parallel processing

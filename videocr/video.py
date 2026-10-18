@@ -20,6 +20,23 @@ logger = logging.getLogger(__name__)
 logging.getLogger('paddleocr').setLevel(logging.ERROR)
 logging.getLogger('paddlex').setLevel(logging.ERROR)
 
+# PP-OCRv6 tiers: single multilingual models (tiny_rec covers all but Japanese).
+_TIERS = ('medium', 'small', 'tiny')
+
+# Languages natively covered by the unified PP-OCRv6 recognition models:
+# Simplified/Traditional Chinese, English, Japanese and Latin-script
+# languages, except 'pi' ('japan' is missing from tiny). Mirrors PaddleOCR's
+# own language mapping (paddleocr/_pipelines/ocr.py, paddleocr/_utils/langs.py).
+_V6_LANGS = frozenset({
+    'ch', 'chinese_cht', 'en', 'japan',
+    'af', 'az', 'bs', 'cs', 'cy', 'da', 'de', 'es', 'et', 'fr', 'ga', 'hr',
+    'hu', 'id', 'is', 'it', 'ku', 'la', 'lt', 'lv', 'mi', 'ms', 'mt', 'nl',
+    'no', 'oc', 'pi', 'pl', 'pt', 'ro', 'rs_latin', 'sk', 'sl', 'sq', 'sv',
+    'sw', 'tl', 'tr', 'uz', 'vi', 'french', 'german', 'fi', 'eu', 'gl',
+    'lb', 'rm', 'ca', 'qu',
+}) - {'pi'}
+
+
 def _model_name_from_dir(model_dir: str | None) -> str | None:
     """Read ``Global.model_name`` from a PaddleX inference model directory.
 
@@ -44,6 +61,19 @@ def _cuda_available() -> bool:
         return False
 
 
+def _unified_v6_supports_lang(lang: str, tier: str) -> bool:
+    """Whether a unified PP-OCRv6 det/rec model pair covers ``lang``.
+
+    Only the tiers other than ``medium`` use these unified models; any other
+    language requires PaddleOCR's per-language prebuilt models, which are
+    selected by passing ``lang`` to PaddleOCR itself.
+    """
+    lang = lang.strip() if isinstance(lang, str) else ''
+    if tier == 'tiny' and lang == 'japan':
+        return False  # PP-OCRv6_tiny_rec does not include Japanese
+    return lang in _V6_LANGS
+
+
 class Video:
     def __init__(self, path: str, det_model_dir: str | None = None, rec_model_dir: str | None = None):
         self.path = path
@@ -56,7 +86,7 @@ class Video:
         self.pred_frames: list[PredictedFrames] = []
         self.pred_subs: list[PredictedSubtitle] = []
 
-    def _create_ocr(self, use_gpu: bool, lang: str) -> PaddleOCR:
+    def _create_ocr(self, use_gpu: bool, lang: str, model_tier: str = 'auto') -> PaddleOCR:
         """Create a PaddleOCR 3.x pipeline.
 
         Compared to PaddleOCR 2.x, the following arguments were renamed:
@@ -65,26 +95,57 @@ class Video:
         ``use_angle_cls`` -> ``use_textline_orientation``, and ``show_log``
         no longer exists (logging is configured through the logging module).
 
-        Unless explicit model directories are given, PaddleOCR's own default
-        models (server-grade PP-OCRv6 "medium", or the prebuilt models for
-        the given ``lang``) are used for the best quality.
+        ``model_tier`` selects the PP-OCRv6 model size (``medium``, ``small``
+        or ``tiny``). With the default ``'auto'``, the server-grade medium
+        models (or the prebuilt models for the given ``lang``) are used on a
+        GPU, while CPU runs automatically switch to the ``small`` tier, which
+        is several times faster for a small accuracy cost.
+
+        Explicit model directories always take precedence over ``model_tier``.
 
         A GPU request automatically falls back to CPU when no GPU is usable
         (for example on a CPU-only Colab runtime).
         """
         if use_gpu and not _cuda_available():
-            logger.warning('use_gpu=True, but no GPU is available; falling back to CPU')
+            logger.warning(
+                'use_gpu=True, but no GPU is available; falling back to CPU. '
+                'CPUs are much slower, especially with the medium models.')
             use_gpu = False
 
         kwargs = {}
+        det_model = rec_model = None
         if self.det_model_dir is None and self.rec_model_dir is None:
-            # Let PaddleOCR pick the default models for the language.
-            kwargs['lang'] = lang
+            tier = model_tier
+            if tier == 'auto':
+                # CPU: the small models are several times faster than the
+                # medium ones, which makes full-video OCR practical there.
+                tier = 'small' if not use_gpu else 'medium'
+            if tier not in _TIERS:
+                raise ValueError(
+                    f"model_tier must be 'auto' or one of {_TIERS}; got {model_tier!r}")
+            if tier != 'medium' and not _unified_v6_supports_lang(lang, tier):
+                logger.warning(
+                    f'PP-OCRv6_{tier} models do not cover lang={lang!r}; '
+                    "using PaddleOCR's default models for that language instead")
+                tier = 'medium'
+            if tier == 'medium':
+                # Let PaddleOCR pick its default (server-grade medium or the
+                # prebuilt per-language models).
+                kwargs['lang'] = lang
+            else:
+                # A single multilingual model per tier, downloaded
+                # automatically on first use.
+                det_model = f'PP-OCRv6_{tier}_det'
+                rec_model = f'PP-OCRv6_{tier}_rec'
+                kwargs['text_detection_model_name'] = det_model
+                kwargs['text_recognition_model_name'] = rec_model
         else:
             # Explicit model directories take precedence; PaddleX requires
             # the model names declared inside those directories.
-            kwargs['text_detection_model_name'] = _model_name_from_dir(self.det_model_dir)
-            kwargs['text_recognition_model_name'] = _model_name_from_dir(self.rec_model_dir)
+            det_model = _model_name_from_dir(self.det_model_dir)
+            rec_model = _model_name_from_dir(self.rec_model_dir)
+            kwargs['text_detection_model_name'] = det_model
+            kwargs['text_recognition_model_name'] = rec_model
 
         if not use_gpu:
             # PaddlePaddle 3.3.x crashes on many CPUs when oneDNN (MKL-DNN) is
@@ -93,6 +154,10 @@ class Video:
             #   ConvertPirAttribute2RuntimeAttribute not support
             # Disable oneDNN for CPU inference to keep it reliable.
             kwargs['enable_mkldnn'] = False
+
+        print(f"PaddleOCR: device={'gpu' if use_gpu else 'cpu'}, "
+              f"detection model={det_model or 'PaddleOCR default'}, "
+              f"recognition model={rec_model or 'PaddleOCR default'}")
 
         return PaddleOCR(
             device='gpu' if use_gpu else 'cpu',
@@ -113,12 +178,13 @@ class Video:
                 conf_threshold: int, use_fullframe: bool, brightness_threshold: int | None,
                 similar_image_threshold: int | None, similar_pixel_threshold: int | None,
                 frames_to_skip: int, crop_x: int | None, crop_y: int | None,
-                crop_width: int | None, crop_height: int | None) -> None:
+                crop_width: int | None, crop_height: int | None,
+                model_tier: str = 'auto') -> None:
         # Initialize parameters
         self.lang = lang
         self.use_fullframe = use_fullframe
         conf_threshold_percent = float(conf_threshold / 100)
-        ocr = self._create_ocr(use_gpu, lang)
+        ocr = self._create_ocr(use_gpu, lang, model_tier)
 
         # Calculate frame ranges
         ocr_start = utils.get_frame_index(time_start, self.fps) if time_start else 0
