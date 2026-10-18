@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "videocr"
+version = "0.2.0"
+description = "Extract hardcoded subtitles from videos using machine learning"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Yi Ge", email = "me@yige.ch" },
+]
+requires-python = ">=3.10"
+keywords = ["ocr", "video", "subtitles", "srt", "paddleocr"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    # PaddleOCR 3.x ships the PP-OCRv5/v6 models used by this library.
+    # The paddlepaddle framework itself is installed separately (see README)
+    # because the CPU and GPU wheels are distributed from different indexes.
+    "paddleocr>=3.0,<4.0",
+    # Fast fuzzy string matching (C++ based, wheels for every supported
+    # Python version). Replaces thefuzz + python-Levenshtein.
+    "rapidfuzz>=3.9",
+]
+
+[project.optional-dependencies]
+# Convenience extra: CPU-only PaddlePaddle from PyPI.
+# For GPU, install paddlepaddle-gpu from the official Paddle index, e.g.:
+#   pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+cpu = ["paddlepaddle>=3.2,<4.0"]
+dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/oliverfei/videocr-PaddleOCR"
+Repository = "https://github.com/obaidabit/videocr-PaddleOCR"
+
+[tool.setuptools]
+packages = ["videocr"]

@@ -1,16 +1,82 @@
 from __future__ import annotations
-from typing import List
+
+import logging
+import time
+import warnings
+from pathlib import Path
+
 import cv2
 import numpy as np
-import time
+import paddle
+import yaml
+from paddleocr import PaddleOCR
+
 from . import utils
 from .models import PredictedFrames, PredictedSubtitle
 from .opencv_adapter import Capture
-from paddleocr import PaddleOCR
-import logging
+
+logger = logging.getLogger(__name__)
+
+# PaddleOCR/PaddleX log a lot of noise; keep the console readable.
+logging.getLogger('paddleocr').setLevel(logging.ERROR)
+logging.getLogger('paddlex').setLevel(logging.ERROR)
+
+# PP-OCRv6 tiers: single multilingual models (tiny_rec covers all but Japanese).
+_TIERS = ('medium', 'small', 'tiny')
+
+# Languages natively covered by the unified PP-OCRv6 recognition models:
+# Simplified/Traditional Chinese, English, Japanese and Latin-script
+# languages, except 'pi' ('japan' is missing from tiny). Mirrors PaddleOCR's
+# own language mapping (paddleocr/_pipelines/ocr.py, paddleocr/_utils/langs.py).
+_V6_LANGS = frozenset({
+    'ch', 'chinese_cht', 'en', 'japan',
+    'af', 'az', 'bs', 'cs', 'cy', 'da', 'de', 'es', 'et', 'fr', 'ga', 'hr',
+    'hu', 'id', 'is', 'it', 'ku', 'la', 'lt', 'lv', 'mi', 'ms', 'mt', 'nl',
+    'no', 'oc', 'pi', 'pl', 'pt', 'ro', 'rs_latin', 'sk', 'sl', 'sq', 'sv',
+    'sw', 'tl', 'tr', 'uz', 'vi', 'french', 'german', 'fi', 'eu', 'gl',
+    'lb', 'rm', 'ca', 'qu',
+}) - {'pi'}
+
+
+def _model_name_from_dir(model_dir: str | None) -> str | None:
+    """Read ``Global.model_name`` from a PaddleX inference model directory.
+
+    PaddleX rejects a model directory whose ``inference.yml`` declares a
+    different model name than the expected one, so the name stored in the
+    directory has to be passed along with the directory.
+    """
+    if not model_dir:
+        return None
+    config_file = Path(model_dir) / 'inference.yml'
+    if not config_file.is_file():
+        return None
+    config = yaml.safe_load(config_file.read_text(encoding='utf-8')) or {}
+    return config.get('Global', {}).get('model_name')
+
+
+def _cuda_available() -> bool:
+    """Return whether a CUDA GPU is usable by the installed PaddlePaddle build."""
+    try:
+        return paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
+    except Exception:
+        return False
+
+
+def _unified_v6_supports_lang(lang: str, tier: str) -> bool:
+    """Whether a unified PP-OCRv6 det/rec model pair covers ``lang``.
+
+    Only the tiers other than ``medium`` use these unified models; any other
+    language requires PaddleOCR's per-language prebuilt models, which are
+    selected by passing ``lang`` to PaddleOCR itself.
+    """
+    lang = lang.strip() if isinstance(lang, str) else ''
+    if tier == 'tiny' and lang == 'japan':
+        return False  # PP-OCRv6_tiny_rec does not include Japanese
+    return lang in _V6_LANGS
+
 
 class Video:
-    def __init__(self, path: str, det_model_dir: str, rec_model_dir: str):
+    def __init__(self, path: str, det_model_dir: str | None = None, rec_model_dir: str | None = None):
         self.path = path
         self.det_model_dir = det_model_dir
         self.rec_model_dir = rec_model_dir
@@ -18,40 +84,134 @@ class Video:
             self.num_frames = int(v.get(cv2.CAP_PROP_FRAME_COUNT))
             self.fps = v.get(cv2.CAP_PROP_FPS)
             self.height = int(v.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.pred_frames = []
-        self.pred_subs = []
+            self.width = int(v.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.pred_frames: list[PredictedFrames] = []
+        self.pred_subs: list[PredictedSubtitle] = []
+
+    def _create_ocr(self, use_gpu: bool, lang: str, model_tier: str = 'auto') -> PaddleOCR:
+        """Create a PaddleOCR 3.x pipeline.
+
+        Compared to PaddleOCR 2.x, the following arguments were renamed:
+        ``det_model_dir``/``rec_model_dir`` -> ``text_detection_model_dir``/
+        ``text_recognition_model_dir``, ``use_gpu`` -> ``device``,
+        ``use_angle_cls`` -> ``use_textline_orientation``, and ``show_log``
+        no longer exists (logging is configured through the logging module).
+
+        ``model_tier`` selects the PP-OCRv6 model size (``medium``, ``small``
+        or ``tiny``). With the default ``'auto'``, the server-grade medium
+        models (or the prebuilt models for the given ``lang``) are used on a
+        GPU, while CPU runs automatically switch to the ``small`` tier, which
+        is several times faster for a small accuracy cost.
+
+        Explicit model directories always take precedence over ``model_tier``.
+
+        A GPU request automatically falls back to CPU when no GPU is usable
+        (for example on a CPU-only Colab runtime).
+        """
+        if use_gpu and not _cuda_available():
+            logger.warning(
+                'use_gpu=True, but no GPU is available; falling back to CPU. '
+                'CPUs are much slower, especially with the medium models.')
+            use_gpu = False
+
+        kwargs = {}
+        det_model = rec_model = None
+        if self.det_model_dir is None and self.rec_model_dir is None:
+            tier = model_tier
+            if tier == 'auto':
+                # CPU: the small models are several times faster than the
+                # medium ones, which makes full-video OCR practical there.
+                tier = 'small' if not use_gpu else 'medium'
+            if tier not in _TIERS:
+                raise ValueError(
+                    f"model_tier must be 'auto' or one of {_TIERS}; got {model_tier!r}")
+            if tier != 'medium' and not _unified_v6_supports_lang(lang, tier):
+                logger.warning(
+                    f'PP-OCRv6_{tier} models do not cover lang={lang!r}; '
+                    "using PaddleOCR's default models for that language instead")
+                tier = 'medium'
+            if tier == 'medium':
+                # Let PaddleOCR pick its default (server-grade medium or the
+                # prebuilt per-language models).
+                kwargs['lang'] = lang
+            else:
+                # A single multilingual model per tier, downloaded
+                # automatically on first use.
+                det_model = f'PP-OCRv6_{tier}_det'
+                rec_model = f'PP-OCRv6_{tier}_rec'
+                kwargs['text_detection_model_name'] = det_model
+                kwargs['text_recognition_model_name'] = rec_model
+        else:
+            # Explicit model directories take precedence; PaddleX requires
+            # the model names declared inside those directories.
+            det_model = _model_name_from_dir(self.det_model_dir)
+            rec_model = _model_name_from_dir(self.rec_model_dir)
+            kwargs['text_detection_model_name'] = det_model
+            kwargs['text_recognition_model_name'] = rec_model
+
+        if not use_gpu:
+            # PaddlePaddle 3.3.x crashes on many CPUs when oneDNN (MKL-DNN) is
+            # used with the PP-OCRv6 detection model:
+            #   NotImplementedError: (Unimplemented)
+            #   ConvertPirAttribute2RuntimeAttribute not support
+            # Disable oneDNN for CPU inference to keep it reliable.
+            kwargs['enable_mkldnn'] = False
+
+        print(f"PaddleOCR: device={'gpu' if use_gpu else 'cpu'}, "
+              f"detection model={det_model or 'PaddleOCR default'}, "
+              f"recognition model={rec_model or 'PaddleOCR default'}")
+
+        return PaddleOCR(
+            device='gpu' if use_gpu else 'cpu',
+            # Explicit model directories, when given, take precedence over
+            # language/model selection.
+            text_detection_model_dir=self.det_model_dir,
+            text_recognition_model_dir=self.rec_model_dir,
+            use_textline_orientation=True,
+            # Video subtitles are upright frames; the document orientation
+            # and unwarping modules are unnecessary and would only slow
+            # down inference and require extra model downloads.
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            **kwargs,
+        )
 
     def run_ocr(self, use_gpu: bool, lang: str, time_start: str, time_end: str,
-                conf_threshold: int, use_fullframe: bool, brightness_threshold: int, 
-                similar_image_threshold: int, similar_pixel_threshold: int, frames_to_skip: int,
-                crop_x: int, crop_y: int, crop_width: int, crop_height: int) -> None:
-        
-        # Disable PaddleOCR logging
-        logging.getLogger("paddleocr").setLevel(logging.ERROR)
-        
+                conf_threshold: int, use_fullframe: bool, brightness_threshold: int | None,
+                similar_image_threshold: int | None, similar_pixel_threshold: int | None,
+                frames_to_skip: int, crop_x: int | None, crop_y: int | None,
+                crop_width: int | None, crop_height: int | None,
+                model_tier: str = 'auto') -> None:
         # Initialize parameters
         self.lang = lang
         self.use_fullframe = use_fullframe
-        conf_threshold_percent = float(conf_threshold/100)
-        ocr = PaddleOCR(lang=self.lang, rec_model_dir=self.rec_model_dir, 
-                        det_model_dir=self.det_model_dir, use_gpu=use_gpu, show_log=False, use_angle_cls=True)
+        conf_threshold_percent = float(conf_threshold / 100)
+        ocr = self._create_ocr(use_gpu, lang, model_tier)
 
         # Calculate frame ranges
         ocr_start = utils.get_frame_index(time_start, self.fps) if time_start else 0
         ocr_end = utils.get_frame_index(time_end, self.fps) if time_end else self.num_frames
         if ocr_end < ocr_start:
             raise ValueError('time_start is later than time_end')
-        
+
         num_ocr_frames = ocr_end - ocr_start
         modulo = frames_to_skip + 1
-        frames_to_process = num_ocr_frames // modulo
+        frames_to_process = (num_ocr_frames + modulo - 1) // modulo
+
+        # Optional one-line progress bar; falls back to print-based progress.
+        try:
+            from tqdm import tqdm as _tqdm
+            pbar = _tqdm(total=frames_to_process, desc='Processing frames', unit='frame',
+                         dynamic_ncols=True, leave=False)
+        except Exception:
+            pbar = None
 
         # Initialize progress tracking
         start_time = time.time()
         frames_processed = 0
 
         # Calculate crop coordinates
-        crop_coords = self._get_crop_coordinates(crop_x, crop_y, crop_width, crop_height)
+        crop_coords = self._resolve_crop(use_fullframe, crop_x, crop_y, crop_width, crop_height)
 
         with Capture(self.path) as v:
             v.set(cv2.CAP_PROP_POS_FRAMES, ocr_start)
@@ -61,56 +221,102 @@ class Video:
             for i in range(num_ocr_frames):
                 if i % modulo == 0:
                     frame = v.read()[1]
+                    if frame is None:
+                        continue
                     frame = self._process_frame(frame, crop_coords, brightness_threshold)
-                    
+
                     if similar_image_threshold and prev_grey is not None:
-                        skip_frame = self._check_similar_frame(frame, prev_grey, similar_image_threshold, 
+                        skip_frame = self._check_similar_frame(frame, prev_grey, similar_image_threshold,
                                                             similar_pixel_threshold, predicted_frames, i + ocr_start)
                         if skip_frame:
+                            if pbar is not None:
+                                pbar.update(1)
                             continue
 
-                    pred_data = ocr.ocr(frame)
-                    if pred_data and pred_data[0]:
+                    pred_data = ocr.predict(frame)
+                    if pred_data and pred_data[0].get('rec_texts'):
                         predicted_frames = PredictedFrames(i + ocr_start, pred_data, conf_threshold_percent)
                         self.pred_frames.append(predicted_frames)
-                    
+
                     # Update progress
                     frames_processed += 1
-                    progress = (frames_processed / frames_to_process) * 100
-                    elapsed_time = time.time() - start_time
-                    estimated_total = elapsed_time / (progress / 100)
-                    remaining_time = estimated_total - elapsed_time
-                    
-                    print(f"\rProgress: {progress:.1f}% - Estimated time remaining: {remaining_time:.1f}s")
+                    if pbar is not None:
+                        pbar.update(1)
+                    elif frames_to_process:
+                        progress = (frames_processed / frames_to_process) * 100
+                        elapsed_time = time.time() - start_time
+                        estimated_total = elapsed_time / (progress / 100)
+                        remaining_time = estimated_total - elapsed_time
+                        print(f"\rProgress: {progress:.1f}% - Estimated time remaining: {remaining_time:.1f}s")
                 else:
                     v.read()
-        
+
+            if pbar is not None:
+                pbar.close()
+
         print("\nOCR Processing completed!")
 
-    def _get_crop_coordinates(self, crop_x: int, crop_y: int, crop_width: int, crop_height: int):
-        if all([crop_x, crop_y, crop_width, crop_height]):
-            return (crop_x, crop_y, crop_x + crop_width, crop_y + crop_height)
-        return None
+    def _resolve_crop(self, use_fullframe: bool, crop_x: int | None, crop_y: int | None,
+                      crop_width: int | None, crop_height: int | None):
+        """Resolve the crop rectangle for OCR.
 
-    def _process_frame(self, frame, crop_coords, brightness_threshold: int):
-        if crop_coords and not self.use_fullframe:
-            x1, y1, x2, y2 = crop_coords
-            frame = frame[y1:y2, x1:x2]
-        elif not self.use_fullframe:
-            frame = frame[self.height // 3:, :]
+        Returns ``(x1, y1, x2, y2)``, or ``None`` when the frame should not be
+        cropped (``use_fullframe`` or degenerate crop; the caller then uses the
+        bottom third of the frame by default).
+
+        Missing crop parameters are inferred: ``x``/``y`` default to 0 and
+        ``width``/``height`` to the remaining frame, so partial crop inputs
+        work. All parameters are clamped to valid frame ranges. Note that
+        ``crop_x``/``crop_y`` of 0 are valid values (not just falsy defaults).
+        """
+        params = [crop_x, crop_y, crop_width, crop_height]
+        if use_fullframe:
+            if any(p is not None for p in params):
+                warnings.warn('use_fullframe=True: ignoring provided crop parameters')
+            return None
+        if all(p is None for p in params):
+            return None  # default: bottom third of the frame
+
+        x = 0 if crop_x is None else int(crop_x)
+        y = 0 if crop_y is None else int(crop_y)
+        width = self.width - x if crop_width is None else int(crop_width)
+        height = self.height - y if crop_height is None else int(crop_height)
+
+        x = max(0, min(x, self.width))
+        y = max(0, min(y, self.height))
+        width = max(0, min(width, self.width - x))
+        height = max(0, min(height, self.height - y))
+        if width == 0 or height == 0:
+            warnings.warn('resolved crop has zero width/height; '
+                          'defaulting to the bottom third of the frame')
+            return None
+        if any(p is None for p in params):
+            warnings.warn('incomplete crop provided; using inferred crop: '
+                          f'x={x}, y={y}, width={width}, height={height}')
+        return (x, y, x + width, y + height)
+
+    def _process_frame(self, frame, crop_coords, brightness_threshold: int | None):
+        if not self.use_fullframe:
+            if crop_coords:
+                x1, y1, x2, y2 = crop_coords
+                frame = frame[y1:y2, x1:x2]
+            else:
+                # only use the bottom third of the frame by default
+                frame = frame[2 * self.height // 3:, :]
 
         if brightness_threshold:
-            frame = cv2.bitwise_and(frame, frame, 
+            frame = cv2.bitwise_and(frame, frame,
                 mask=cv2.inRange(frame, (brightness_threshold,)*3, (255,)*3))
         return frame
 
-    def _check_similar_frame(self, frame, prev_grey, similar_image_threshold: int, 
-                           similar_pixel_threshold: int, predicted_frames, frame_index: int):
+    def _check_similar_frame(self, frame, prev_grey, similar_image_threshold: int,
+                           similar_pixel_threshold: int | None, predicted_frames,
+                           frame_index: int):
         grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, absdiff = cv2.threshold(cv2.absdiff(prev_grey, grey), 
+        _, absdiff = cv2.threshold(cv2.absdiff(prev_grey, grey),
                                  similar_pixel_threshold, 255, cv2.THRESH_BINARY)
-        
-        if (np.count_nonzero(absdiff) < similar_image_threshold and 
+
+        if (np.count_nonzero(absdiff) < similar_image_threshold and
             predicted_frames is not None):
             predicted_frames.end_index = frame_index
             return True
@@ -120,30 +326,27 @@ class Video:
         self._generate_subtitles(sim_threshold)
         return ''.join(
             f'{i}\n{utils.get_srt_timestamp(sub.index_start, self.fps)} --> '
-            f'{utils.get_srt_timestamp(sub.index_end, self.fps)}\n{sub.text}\n\n'
-            for i, sub in enumerate(self.pred_subs))
+            f'{utils.get_srt_timestamp(sub.index_end + 1, self.fps)}\n{sub.text}\n\n'
+            for i, sub in enumerate(self.pred_subs, start=1))
 
     def _generate_subtitles(self, sim_threshold: int) -> None:
-        if not hasattr(self, 'pred_frames'):
-            raise AttributeError('Please call self.run_ocr() first to perform ocr on frames')
-            
         self.pred_subs = []
         max_frame_merge_diff = int(0.09 * self.fps)
-        
+
         for frame in self.pred_frames:
             self._append_sub(PredictedSubtitle([frame], sim_threshold), max_frame_merge_diff)
-        
+
         self.pred_subs = [sub for sub in self.pred_subs if sub.frames[0].lines]
 
     def _append_sub(self, sub: PredictedSubtitle, max_frame_merge_diff: int) -> None:
         if not sub.frames:
             return
 
-        if (self.pred_subs and self.pred_subs[-1].frames[0].lines and 
-            sub.index_start - self.pred_subs[-1].index_end <= max_frame_merge_diff and 
+        if (self.pred_subs and self.pred_subs[-1].frames[0].lines and
+            sub.index_start - self.pred_subs[-1].index_end <= max_frame_merge_diff and
             self.pred_subs[-1].is_similar_to(sub)):
-            
+
             last_sub = self.pred_subs.pop()
             sub = PredictedSubtitle(last_sub.frames + sub.frames, sub.sim_threshold)
-        
+
         self.pred_subs.append(sub)
